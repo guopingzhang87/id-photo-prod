@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
       .jpeg({ quality: 95 })
       .toBuffer()
 
-    return new NextResponse(composed, {
+    return new Response(composed, {
       status: 200,
       headers: {
         'Content-Type': 'image/jpeg',
