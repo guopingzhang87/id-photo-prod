@@ -82,7 +82,7 @@ src/app/
 
 1. Fork 本仓库
 2. 在 Vercel 导入项目
-3. 在环境变量中配置 `REMOVEBG_API_KEY`
+3. 在环境变量中配置 `REMOVEBG_API_KEY` 
 4. 部署完成
 
 ---
