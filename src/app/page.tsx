@@ -20,6 +20,84 @@ const BG_COLORS = [
 
 type Step = 'upload' | 'processing' | 'done' | 'error'
 
+// 用浏览器 Canvas 合成证件照（替代服务端 sharp）
+async function composeIdPhoto(
+  base64Png: string,
+  bgColor: string,
+  width: number,
+  height: number
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d')!
+      // 填充背景色
+      ctx.fillStyle = bgColor
+      ctx.fillRect(0, 0, width, height)
+      // cover 模式：按比例缩放，头部居上
+      const scale = Math.max(width / img.width, height / img.height)
+      const sw = img.width * scale
+      const sh = img.height * scale
+      const sx = (width - sw) / 2
+      const sy = 0 // 头部居上
+      ctx.drawImage(img, sx, sy, sw, sh)
+      resolve(canvas.toDataURL('image/jpeg', 0.95))
+    }
+    img.onerror = reject
+    img.src = 'data:image/png;base64,' + base64Png
+  })
+}
+
+// 用浏览器 Canvas 生成 A4 排版
+async function composeA4(
+  base64Png: string,
+  bgColor: string,
+  width: number,
+  height: number
+): Promise<Blob> {
+  const A4_WIDTH = 2480
+  const A4_HEIGHT = 3508
+  const PADDING = 80
+  const GAP = 40
+
+  const cols = Math.floor((A4_WIDTH - PADDING * 2 + GAP) / (width + GAP))
+  const rows = Math.floor((A4_HEIGHT - PADDING * 2 + GAP) / (height + GAP))
+  const total = cols * rows
+
+  // 先合成单张
+  const singleDataUrl = await composeIdPhoto(base64Png, bgColor, width, height)
+
+  return new Promise((resolve, reject) => {
+    const singleImg = new Image()
+    singleImg.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = A4_WIDTH
+      canvas.height = A4_HEIGHT
+      const ctx = canvas.getContext('2d')!
+      // 白色背景
+      ctx.fillStyle = '#FFFFFF'
+      ctx.fillRect(0, 0, A4_WIDTH, A4_HEIGHT)
+      // 排列证件照
+      for (let i = 0; i < total; i++) {
+        const col = i % cols
+        const row = Math.floor(i / cols)
+        const left = PADDING + col * (width + GAP)
+        const top = PADDING + row * (height + GAP)
+        ctx.drawImage(singleImg, left, top, width, height)
+      }
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error('Canvas toBlob failed'))
+      }, 'image/jpeg', 0.95)
+    }
+    singleImg.onerror = reject
+    singleImg.src = singleDataUrl
+  })
+}
+
 export default function Home() {
   const [step, setStep] = useState<Step>('upload')
   const [originalUrl, setOriginalUrl] = useState<string | null>(null)
@@ -45,13 +123,12 @@ export default function Home() {
       return
     }
 
-    // 预览原图
     setOriginalUrl(URL.createObjectURL(file))
     setStep('processing')
     setProcessedUrl(null)
 
     try {
-      // Step 1: 去背
+      // Step 1: 去背（服务端）
       const formData = new FormData()
       formData.append('image', file)
       const bgRes = await fetch('/api/remove-bg', { method: 'POST', body: formData })
@@ -60,9 +137,9 @@ export default function Home() {
         throw new Error(err.error || '背景去除失败')
       }
       const bgJson = await bgRes.json()
-      setRemovedBgData(bgJson.data) // base64 PNG
+      setRemovedBgData(bgJson.data)
 
-      // Step 2: 合成
+      // Step 2: 合成（浏览器端 Canvas）
       await applySettings(bgJson.data, selectedBg.hex, selectedSpec)
     } catch (e: unknown) {
       setErrorMsg(e instanceof Error ? e.message : '处理失败，请重试')
@@ -70,7 +147,7 @@ export default function Home() {
     }
   }, [selectedBg, selectedSpec])
 
-  // 应用背景色 + 规格
+  // 用 Canvas 合成
   const applySettings = useCallback(async (
     bgData: string,
     bgColor: string,
@@ -78,17 +155,8 @@ export default function Home() {
   ) => {
     setIsProcessing(true)
     try {
-      const res = await fetch('/api/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageData: bgData, bgColor, width: spec.width, height: spec.height }),
-      })
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.error || '合成失败')
-      }
-      const blob = await res.blob()
-      setProcessedUrl(URL.createObjectURL(blob))
+      const dataUrl = await composeIdPhoto(bgData, bgColor, spec.width, spec.height)
+      setProcessedUrl(dataUrl)
       setStep('done')
     } catch (e: unknown) {
       setErrorMsg(e instanceof Error ? e.message : '合成失败，请重试')
@@ -109,41 +177,32 @@ export default function Home() {
     if (removedBgData) await applySettings(removedBgData, selectedBg.hex, spec)
   }
 
-  // 下载 A4 排版
-  const handleDownloadA4 = async () => {
-    if (!removedBgData) return
-    setIsProcessing(true)
-    try {
-      const res = await fetch('/api/layout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageData: removedBgData,
-          bgColor: selectedBg.hex,
-          width: selectedSpec.width,
-          height: selectedSpec.height,
-        }),
-      })
-      if (!res.ok) throw new Error('排版失败')
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `id-photo-A4-${selectedSpec.id}.jpg`
-      a.click()
-    } catch (e: unknown) {
-      setErrorMsg(e instanceof Error ? e.message : '排版失败')
-    } finally {
-      setIsProcessing(false)
-    }
-  }
-
+  // 下载单张
   const handleDownloadSingle = () => {
     if (!processedUrl) return
     const a = document.createElement('a')
     a.href = processedUrl
     a.download = `id-photo-${selectedSpec.id}.jpg`
     a.click()
+  }
+
+  // 下载 A4 排版（浏览器端）
+  const handleDownloadA4 = async () => {
+    if (!removedBgData) return
+    setIsProcessing(true)
+    try {
+      const blob = await composeA4(removedBgData, selectedBg.hex, selectedSpec.width, selectedSpec.height)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `id-photo-A4-${selectedSpec.id}.jpg`
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e: unknown) {
+      setErrorMsg(e instanceof Error ? e.message : '排版失败')
+    } finally {
+      setIsProcessing(false)
+    }
   }
 
   const handleReset = () => {
